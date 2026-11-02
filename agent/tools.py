@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from rapidfuzz import fuzz
+
 from agent import db
 from agent.auth import AuthContext, can_cancel_order, permission_denied
 from agent.helpcenter import load_policy_docs
@@ -27,6 +29,7 @@ from agent.killswitch import kill_switch
 
 MAX_SEARCH_LIMIT = 25
 DEFAULT_ORDER_LIMIT = 20
+FUZZY_MATCH_THRESHOLD = 80  # rapidfuzz partial_ratio score, 0-100
 
 
 def get_policy(ctx: AuthContext, policy_id: str) -> dict[str, Any]:
@@ -52,8 +55,20 @@ def get_policy(ctx: AuthContext, policy_id: str) -> dict[str, Any]:
     Implementation notes:
         agent.helpcenter.load_policy_docs() returns every parsed doc.
     """
-    ### YOUR CODE HERE (HW1)
-    raise NotImplementedError("HW1: implement get_policy")
+    for doc in load_policy_docs():
+        if doc.policy_id == policy_id:
+            return {
+                "ok": True,
+                "policy_id": doc.policy_id,
+                "title": doc.title,
+                "audience": doc.audience,
+                "body": doc.body,
+            }
+    return {
+        "ok": False,
+        "error": "not_found",
+        "reason": f"Policy '{policy_id}' not found. Contact customer support.",
+    }
 
 
 def search_products(
@@ -95,8 +110,52 @@ def search_products(
         agent.db.list_products(conn, store_id) gives the candidate set.
         Use `with db.connection() as conn:` to close the database automatically.
     """
-    ### YOUR CODE HERE (HW1)
-    raise NotImplementedError("HW1: implement search_products")
+    tokens = query.lower().split()
+    if not tokens:
+        return {
+            "ok": False,
+            "error": "invalid_argument",
+            "reason": "query must not be empty.",
+        }
+    if max_price_usd is not None and max_price_usd <= 0:
+        return {
+            "ok": False,
+            "error": "invalid_argument",
+            "reason": "max_price_usd must be greater than zero.",
+        }
+    limit = max(1, min(limit, MAX_SEARCH_LIMIT))
+
+    with db.connection() as conn:
+        store_id = None
+        if store is not None:
+            found = db.get_store_by_name(conn, store)
+            if found is None:
+                return {
+                    "ok": False,
+                    "error": "not_found",
+                    "reason": f"No store matches '{store}'.",
+                }
+            store_id = found.id
+        candidates = db.list_products(conn, store_id)
+
+    products = []
+    for p in candidates:
+        text = f"{p.title} {p.description}".lower()
+        if not all(token in text for token in tokens):
+            continue
+        if max_price_usd is not None and p.price_cents > round(max_price_usd * 100):
+            continue
+        products.append(
+            {
+                "product_id": p.id,
+                "store_id": p.store_id,
+                "title": p.title,
+                "price_usd": p.price_cents / 100,
+            }
+        )
+    products.sort(key=lambda p: (p["price_usd"], p["product_id"]))
+    products = products[:limit]
+    return {"ok": True, "products": products, "count": len(products)}
 
 
 def list_my_orders(ctx: AuthContext) -> dict[str, Any]:
@@ -121,8 +180,29 @@ def list_my_orders(ctx: AuthContext) -> dict[str, Any]:
         scope is baked into which query you run. That is the point of the
         tool: the model cannot ask for someone else's orders through it.
     """
-    ### YOUR CODE HERE (HW1)
-    raise NotImplementedError("HW1: implement list_my_orders")
+    if ctx.role == "support":
+        return {
+            "ok": False,
+            "error": "invalid_argument",
+            "reason": "Support staff have no orders of their own; "
+            "look up a specific order with get_order instead.",
+        }
+    with db.connection() as conn:
+        if ctx.role == "shopper":
+            orders = db.list_orders_for_user(conn, ctx.user_id, DEFAULT_ORDER_LIMIT)
+        elif ctx.role == "merchant" and ctx.store_id is not None:
+            orders = db.list_orders_for_store(conn, ctx.store_id, DEFAULT_ORDER_LIMIT)
+        else:
+            return {
+                "ok": False,
+                "error": "invalid_argument",
+                "reason": "No order scope is available for this caller.",
+            }
+    return {
+        "ok": True,
+        "orders": [o.to_public_dict() for o in orders],
+        "count": len(orders),
+    }
 
 
 def cancel_order(ctx: AuthContext, order_id: int, reason: str) -> dict[str, Any]:
@@ -167,8 +247,28 @@ def cancel_order(ctx: AuthContext, order_id: int, reason: str) -> dict[str, Any]
     paused = kill_switch("cancel_order")
     if paused is not None:
         return {"ok": False, "error": "paused", "reason": paused}
-    ### YOUR CODE HERE (HW1)
-    raise NotImplementedError("HW1: implement cancel_order")
+    with db.connection() as conn:
+        order = db.get_order(conn, order_id)
+        if order is None:
+            return {
+                "ok": False,
+                "error": "not_found",
+                "reason": f"No order with id {order_id}.",
+            }
+        # Scope first, so an out-of-scope caller learns nothing about the status.
+        if not can_cancel_order(ctx, order.user_id, order.store_id):
+            return permission_denied(
+                f"A {ctx.role} may not cancel order {order_id}."
+            )
+        if order.status != "placed":
+            return {
+                "ok": False,
+                "error": "not_eligible",
+                "reason": f"Order {order_id} is '{order.status}'; "
+                "orders can be cancelled only before shipment.",
+            }
+        db.set_order_status(conn, order_id, "cancelled")
+    return {"ok": True, "order_id": order_id, "status": "cancelled"}
 
 
 def find_order(ctx: AuthContext, query: str) -> dict[str, Any]:
@@ -202,5 +302,119 @@ def find_order(ctx: AuthContext, query: str) -> dict[str, Any]:
         (at most 5), each as the dict returned by agent.db. If no orders
         match, return {"ok": True, "orders": []}.
     """
-    ### YOUR CODE HERE (HW1)
-    raise NotImplementedError("HW1: implement find_order")
+    query = query.strip().lower()
+    if not query:
+        return {"ok": True, "orders": []}
+
+    with db.connection() as conn:
+        # The scope comes from the authenticated context, never from the query.
+        if ctx.role == "shopper" and ctx.user_id is not None:
+            candidates = db.list_order_search_candidates(conn, user_id=ctx.user_id)
+        elif ctx.role == "merchant" and ctx.store_id is not None:
+            candidates = db.list_order_search_candidates(conn, store_id=ctx.store_id)
+        elif ctx.role == "support":
+            candidates = db.list_order_search_candidates(conn, all_orders=True)
+        else:
+            return permission_denied(
+                f"No order search scope is available for role '{ctx.role}'."
+            )
+        titles = {p.id: p.title.lower() for p in db.list_products(conn)}
+
+    # partial_ratio scores the shorter string against the best-aligned slice of the
+    # longer one, so a product name inside a long sentence still scores high.
+    matches = [
+        o
+        for o in candidates
+        if titles.get(o.product_id)
+        and fuzz.partial_ratio(query, titles[o.product_id]) >= FUZZY_MATCH_THRESHOLD
+    ]
+    return {"ok": True, "orders": [o.to_public_dict() for o in matches[:5]]}
+
+
+def browse_catalog(
+    ctx: AuthContext, category: str | None = None, sample: int = 5
+) -> dict[str, Any]:
+    """Summarise what Cartwheel sells, by category. Risk tier: read.
+
+    Not one of the five assigned tools; added because shoppers often ask what
+    they can buy without knowing a product name. Every role may browse.
+
+    Rows that fail the minimum criteria are ignored everywhere: a product needs
+    a non-blank title and a strictly positive price to be counted or shown.
+
+    Args:
+        ctx: The caller's auth context.
+        category: Optional category name, matched case-insensitively with spaces
+            or hyphens read as underscores ("home and kitchen" matches
+            home_and_kitchen). Omit it for the overview.
+        sample: With a category, how many products to list, cheapest first.
+            Clamped to [1, MAX_SEARCH_LIMIT].
+
+    Returns:
+        Overview (no category): {"ok": True, "product_count": int,
+        "categories": [{"category", "product_count", "min_price_usd",
+        "max_price_usd", "avg_price_usd", "stores": [store names]}, ...]},
+        categories sorted by name.
+        With a category: {"ok": True, "category": <that summary dict>,
+        "products": [{"product_id", "store_id", "store_name", "title",
+        "price_usd"}, ...]}, sorted by price then product_id.
+        An unknown category: {"ok": False, "error": "not_found", "reason": ...}
+        naming the category and listing the valid ones.
+    """
+    with db.connection() as conn:
+        products = [
+            p for p in db.list_products(conn) if p.title.strip() and p.price_cents > 0
+        ]
+        store_names: dict[int, str] = {}
+        for p in products:
+            if p.store_id not in store_names:
+                store = db.get_store(conn, p.store_id)
+                store_names[p.store_id] = store.name if store else f"store {p.store_id}"
+
+    by_category: dict[str, list[db.Product]] = {}
+    for p in products:
+        by_category.setdefault(p.category, []).append(p)
+
+    def summary(name: str) -> dict[str, Any]:
+        items = by_category[name]
+        prices = [p.price_usd for p in items]
+        return {
+            "category": name,
+            "product_count": len(items),
+            "min_price_usd": min(prices),
+            "max_price_usd": max(prices),
+            "avg_price_usd": round(sum(prices) / len(prices), 2),
+            "stores": sorted({store_names[p.store_id] for p in items}),
+        }
+
+    if category is None or not category.strip():
+        return {
+            "ok": True,
+            "product_count": len(products),
+            "categories": [summary(name) for name in sorted(by_category)],
+        }
+
+    wanted = category.strip().lower().replace(" ", "_").replace("-", "_")
+    if wanted not in by_category:
+        return {
+            "ok": False,
+            "error": "not_found",
+            "reason": f"No category '{category}'. Valid categories: "
+            + ", ".join(sorted(by_category)),
+        }
+    sample = max(1, min(sample, MAX_SEARCH_LIMIT))
+    chosen = sorted(by_category[wanted], key=lambda p: (p.price_cents, p.id))[:sample]
+    return {
+        "ok": True,
+        "category": summary(wanted),
+        "products": [
+            {
+                "product_id": p.id,
+                "store_id": p.store_id,
+                "store_name": store_names[p.store_id],
+                "title": p.title,
+                "price_usd": p.price_usd,
+            }
+            for p in chosen
+        ],
+    }

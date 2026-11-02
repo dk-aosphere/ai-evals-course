@@ -406,6 +406,18 @@ def search_products(
 
 
 @function_tool
+def browse_catalog(
+    wrapper: RunContextWrapper[AuthContext], category: str | None = None, sample: int = 5
+) -> dict[str, Any]:
+    """Browse what Cartwheel sells. Use this when the user asks what they can buy
+    or what is available and has no specific product in mind. With no category it
+    returns every category with its product count, price range and stores; with a
+    category it also lists a few of its cheapest products. Use search_products
+    once the user names something specific."""
+    return _call(wrapper, hw_tools.browse_catalog, category, sample)
+
+
+@function_tool
 def list_my_orders(wrapper: RunContextWrapper[AuthContext]) -> dict[str, Any]:
     """List the caller's recent orders (shopper) or their store's recent orders (merchant)."""
     return _call(wrapper, hw_tools.list_my_orders)
@@ -435,6 +447,7 @@ _COMMON_TOOLS = [
     search_help_center,
     get_policy,
     search_products,
+    browse_catalog,
     get_order,
     issue_refund,
     cancel_order,
